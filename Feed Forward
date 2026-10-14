@@ -1,0 +1,218 @@
+// --- Motor Pins ---
+#define IN1 5        // left motor A
+#define IN2 18       // left motor B
+#define IN3 19       // right motor A
+#define IN4 21       // right motor B
+
+// --- Speed Settings (Min PWM floor above 170 to prevent stalling) ---
+const int cruisingSpeed = 180; 
+const int cornerSpeed = 175;   // Kept safely above the 170 stall limit
+const int minStallPWM = 150;   // Absolute minimum PWM floor for any moving motor
+const int maxPWM = 200;      
+
+// --- Pure Feedforward Constants ---
+float Kff = 4.5;               // Pure feedforward gain (anticipates future position change)
+float smoothedError = 0;
+float lastRawError = 0;        // Required for calculating rate of change
+const float smoothingAlpha = 0.7; 
+
+// --- Analog IR Sensor Pins ---
+const int sensorPins[8] = {13, 12, 14, 27, 26, 4, 33, 32};
+
+// --- Calibration Storage Variables ---
+int sensorMin[8] = {4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095};
+int sensorMax[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+int sensorVal[8];
+
+// --- Memory for Last Seen Position ---
+int lastDirection = 0; 
+int lostLineCounter = 0; 
+
+void setup() {
+  Serial.begin(115200);
+
+  // --- Prevent Startup Motor Jitter ---
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+
+  // Attach Motor Pins using ESP32 Core v3.x LEDC API (20kHz)
+  ledcAttach(IN1, 20000, 8);
+  ledcAttach(IN2, 20000, 8);
+  ledcAttach(IN3, 20000, 8);
+  ledcAttach(IN4, 20000, 8);
+
+  // --- Stationary Auto-Calibration (Motors OFF for 2 Seconds) ---
+  Serial.println("Keep motors off! Auto-calibrating ambient lighting...");
+  stopMotors();
+  
+  unsigned long calibStartTime = millis();
+  while (millis() - calibStartTime < 2000) {
+    for (int i = 0; i < 8; i++) {
+      int val = analogRead(sensorPins[i]);
+      if (val < sensorMin[i]) sensorMin[i] = val;
+      if (val > sensorMax[i]) sensorMax[i] = val;
+    }
+  }
+
+  Serial.println("Calibration Complete! Starting line follower...");
+  delay(1000);
+}
+
+void loop() {
+  long weightedSum = 0;
+  int activeSensors = 0;
+  long totalReflectance = 0;
+
+  // Read and normalize sensors based on calibration
+  for (int i = 0; i < 8; i++) {
+    int rawVal = analogRead(sensorPins[i]);
+    int calibratedVal = constrain(map(rawVal, sensorMin[i], sensorMax[i], 0, 1000), 0, 1000);
+    sensorVal[i] = calibratedVal;
+
+    if (sensorVal[i] > 100) {
+      float baseWeight = (i - 3.5); 
+      float adjustedWeight = baseWeight * abs(baseWeight) * 10.0; 
+      
+      weightedSum += (long)sensorVal[i] * adjustedWeight;
+      totalReflectance += sensorVal[i];
+      activeSensors++;
+    }
+  }
+
+  // --- Hard Turn Detection (90-Degree & 180-Degree U-Turns) ---
+  bool sharpLeftTurn = (sensorVal[0] > 400 || sensorVal[1] > 400) && (sensorVal[6] < 200 && sensorVal[7] < 200);
+  bool sharpRightTurn = (sensorVal[6] > 400 || sensorVal[7] > 400) && (sensorVal[0] < 200 && sensorVal[1] < 200);
+
+  // --- Line Following Logic ---
+  if (activeSensors > 0) {
+    lostLineCounter = 0; 
+    float rawError = (float)weightedSum / totalReflectance;
+    
+    // Smooth the error just for monitoring/speed-switching decisions
+    smoothedError = (smoothingAlpha * rawError) + ((1.0 - smoothingAlpha) * smoothedError);
+
+    // --- PURE FEEDFORWARD CORRECTION ---
+    // Correction is driven strictly by how fast the error is changing (rate of change)
+    float errorDerivative = rawError - lastRawError;
+    int correction = Kff * errorDerivative;
+
+    // Save current error for the next loop's feedforward calculation
+    lastRawError = rawError;
+
+    int currentSpeed = cruisingSpeed;
+    if (abs(smoothedError) > 5 || sharpLeftTurn || sharpRightTurn) {
+      currentSpeed = cornerSpeed; 
+    }
+
+    int leftMotorSpeed = currentSpeed + correction;
+    int rightMotorSpeed = currentSpeed - correction;
+
+    // Hard Pivot Overrides for 90/180-degree angles (Enforcing anti-stall minimums)
+    if (sharpLeftTurn) {
+      leftMotorSpeed = -minStallPWM;  
+      rightMotorSpeed = maxPWM;  
+      lastDirection = -1;
+    } else if (sharpRightTurn) {
+      leftMotorSpeed = maxPWM;    
+      rightMotorSpeed = -minStallPWM; 
+      lastDirection = 1;
+    }
+
+    driveMotorsAntiStall(leftMotorSpeed, rightMotorSpeed);
+
+    // Update last direction memory cleanly based on error
+    if (smoothedError < -0.2) {
+      lastDirection = -1; 
+    } else if (smoothedError > 0.2) {
+      lastDirection = 1;  
+    }
+  }
+
+  // --- Extended Recovery Logic for 180-Degree U-Turns ---
+  if (activeSensors == 0) {
+    lostLineCounter++;
+    lastRawError = 0; // Reset derivative memory when line is lost
+    
+    // Extended buffer window (80 cycles): Gives the bot plenty of time to loop through a 180-degree turn
+    if (lostLineCounter < 80) {
+      if (lastDirection == -1) {
+        driveMotorsAntiStall(minStallPWM, cruisingSpeed); // Deep sweep left for U-turn
+      } else if (lastDirection == 1) {
+        driveMotorsAntiStall(cruisingSpeed, minStallPWM); // Deep sweep right for U-turn
+      } else {
+        moveMotors(cruisingSpeed, cruisingSpeed); 
+      }
+    } else {
+      // If completely lost after a full loop attempt, aggressive spin sweep using last direction
+      int searchSpeed = 200; 
+      if (lastDirection <= 0) {
+        spinLeft(searchSpeed);
+      } else {
+        spinRight(searchSpeed);
+      }
+    }
+  }
+}
+
+// --- Anti-Stall Motor Driver ---
+void driveMotorsAntiStall(int leftSpd, int rightSpd) {
+  if (leftSpd >= 0) {
+    if (leftSpd > 0) leftSpd = max(leftSpd, minStallPWM); 
+    leftSpd = constrain(leftSpd, 0, maxPWM);
+    ledcWrite(IN1, leftSpd);
+    ledcWrite(IN2, 0);
+  } else {
+    int revSpd = constrain(-leftSpd, minStallPWM, maxPWM); 
+    ledcWrite(IN1, 0);
+    ledcWrite(IN2, revSpd); 
+  }
+
+  if (rightSpd >= 0) {
+    if (rightSpd > 0) rightSpd = max(rightSpd, minStallPWM); 
+    rightSpd = constrain(rightSpd, 0, maxPWM);
+    ledcWrite(IN3, rightSpd);
+    ledcWrite(IN4, 0);
+  } else {
+    int revSpd = constrain(-rightSpd, minStallPWM, maxPWM); 
+    ledcWrite(IN3, 0);
+    ledcWrite(IN4, revSpd); 
+  }
+}
+
+void moveMotors(int leftSpd, int rightSpd) {
+  leftSpd = max(leftSpd, minStallPWM);
+  rightSpd = max(rightSpd, minStallPWM);
+  ledcWrite(IN1, constrain(leftSpd, 0, maxPWM));
+  ledcWrite(IN2, 0);
+  ledcWrite(IN3, constrain(rightSpd, 0, maxPWM));
+  ledcWrite(IN4, 0);
+}
+
+void spinLeft(int spd) {
+  spd = max(spd, minStallPWM);
+  ledcWrite(IN1, 0);
+  ledcWrite(IN2, constrain(spd, 0, maxPWM));
+  ledcWrite(IN3, constrain(spd, 0, maxPWM));
+  ledcWrite(IN4, 0);
+}
+
+void spinRight(int spd) {
+  spd = max(spd, minStallPWM);
+  ledcWrite(IN1, constrain(spd, 0, maxPWM));
+  ledcWrite(IN2, 0);
+  ledcWrite(IN3, 0);
+  ledcWrite(IN4, constrain(spd, 0, maxPWM));
+}
+
+void stopMotors() {
+  ledcWrite(IN1, 0);
+  ledcWrite(IN2, 0);
+  ledcWrite(IN3, 0);
+  ledcWrite(IN4, 0);
+}
