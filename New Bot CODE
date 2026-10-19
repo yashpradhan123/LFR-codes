@@ -10,7 +10,7 @@
 #define IN4 9   // Right Motor PWM B
 
 // Suction Impeller Control Pin (Moved to D11 for hardware PWM support)
-#define SUCTION_PIN 11 
+#define SUCTION_PIN 12 
 
 // Analog IR Sensor Pins (Left to Right: A7 down to A0)
 const uint8_t sensorPins[8] = {A7, A6, A5, A4, A3, A2, A1, A0};
