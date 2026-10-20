@@ -1,0 +1,183 @@
+/* =========================================================================
+   ATmega Architecture - Adaptive PD Line Follower (Flex Banner Print Optimized)
+   Hardware: Arduino Nano, DRV8833, 8 Analog Sensors, Suction D2
+   ========================================================================= */
+
+// --- 1. PINOUTS & HARDWARE DEFINITIONS ---
+#define IN1 6
+#define IN2 5
+#define IN3 10
+#define IN4 9
+
+#define SUCTION_PIN 2
+
+// Analog IR Sensor Pins (Left to Right: A7 down to A0)
+const uint8_t sensorPins[8] = {A7, A6, A5, A4, A3, A2, A1, A0};
+
+int minVal[8];
+int maxVal[8];
+int threshold[8];
+
+const int weights[8] = {-3500, -2000, -1000, -500, 500, 1000, 2000, 3500};
+
+// --- 2. TUNING PARAMETERS ---
+int baseSpeed = 60;
+int maxSpeed = 255;
+int turnSpeed = 98;
+int suctionPower = 200;
+
+float Kp = 0.093;
+float Kd = 1.650;
+
+int lastError = 0;
+int lastDirection = 1;  // 1 = Right, -1 = Left
+
+// --- 3. HELPER FUNCTIONS ---
+
+void setMotors(int leftSpeed, int rightSpeed) {
+  leftSpeed = constrain(leftSpeed, -maxSpeed, maxSpeed);
+  rightSpeed = constrain(rightSpeed, -maxSpeed, maxSpeed);
+
+  if (leftSpeed >= 0) {
+    analogWrite(IN1, leftSpeed);
+    analogWrite(IN2, 0);
+  } else {
+    analogWrite(IN1, 0);
+    analogWrite(IN2, -leftSpeed);
+  }
+
+  if (rightSpeed >= 0) {
+    analogWrite(IN3, rightSpeed);
+    analogWrite(IN4, 0);
+  } else {
+    analogWrite(IN3, 0);
+    analogWrite(IN4, -rightSpeed);
+  }
+}
+
+// --- FLEX BANNER LOW-CONTRAST CALIBRATION ---
+void calibrateRobot() {
+  for (uint8_t i = 0; i < 8; i++) {
+    minVal[i] = 1023;
+    maxVal[i] = 0;
+  }
+
+  // Perform 4 sweeps to capture reflection bounds
+  for (int sweep = 0; sweep < 4; sweep++) {
+    int dir = (sweep % 2 == 0) ? 1 : -1;
+    setMotors(dir * turnSpeed, -dir * turnSpeed);
+
+    unsigned long sweepStart = millis();
+
+    while (millis() - sweepStart < 750) {
+      for (uint8_t i = 0; i < 8; i++) {
+        int val = analogRead(sensorPins[i]);
+
+        if (val < minVal[i]) minVal[i] = val;
+        if (val > maxVal[i]) maxVal[i] = val;
+      }
+
+      delay(2);
+    }
+
+    setMotors(0, 0);
+    delay(100);
+  }
+
+  // Calculate thresholds dynamically
+  for (uint8_t i = 0; i < 8; i++) {
+    int range = maxVal[i] - minVal[i];
+
+    if (range < 40) {
+      maxVal[i] = minVal[i] + 40;
+    }
+
+    threshold[i] = minVal[i] + (range * 0.45);
+  }
+
+  setMotors(0, 0);
+  delay(500);
+}
+
+// --- 4. SETUP & LOOP ---
+void setup() {
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(SUCTION_PIN, OUTPUT);
+
+  for (uint8_t i = 0; i < 8; i++) {
+    pinMode(sensorPins[i], INPUT);
+  }
+
+  Serial.begin(9600);
+  delay(500);
+
+  for (int speed = 0; speed <= suctionPower; speed += 10) {
+    analogWrite(SUCTION_PIN, speed);
+    delay(15);
+  }
+
+  calibrateRobot();
+}
+
+void loop() {
+  analogWrite(SUCTION_PIN, suctionPower);
+
+  long position = 0;
+  long sum = 0;
+  int activeSensors = 0;
+
+  for (uint8_t i = 0; i < 8; i++) {
+    int raw = analogRead(sensorPins[i]);
+
+    // Full scaling relative to measured min/max bounds
+    long normalized = map(raw, minVal[i], maxVal[i], 0, 1000);
+    normalized = constrain(normalized, 0, 1000);
+
+    if (raw > threshold[i]) {
+      activeSensors++;
+    }
+
+    sum += normalized;
+    position += normalized * weights[i];
+  }
+
+  // --- LINE-LOST RECOVERY ---
+  if (activeSensors == 0 || sum < 200) {
+
+    // Continue searching in the last detected direction
+    // until the line is detected again.
+    if (lastDirection > 0) {
+      setMotors(turnSpeed, -turnSpeed);  // Search right
+    } else {
+      setMotors(-turnSpeed, turnSpeed);  // Search left
+    }
+
+    return;
+  }
+
+  // --- LINE DETECTED ---
+  int error = position / sum;
+
+  // Update direction whenever the line is off-center.
+  // Positive error = line is to the right.
+  // Negative error = line is to the left.
+  if (error > 0) {
+    lastDirection = 1;
+  } else if (error < 0) {
+    lastDirection = -1;
+  }
+
+  // --- PD CONTROL ---
+  int derivative = error - lastError;
+  int correction = (int)(Kp * error + Kd * derivative);
+
+  lastError = error;
+
+  int leftSpeed = baseSpeed + correction;
+  int rightSpeed = baseSpeed - correction;
+
+  setMotors(leftSpeed, rightSpeed);
+}
