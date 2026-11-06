@@ -1,0 +1,237 @@
+// =================================================================
+//    TECHNOXIAN HIGH-SPEED 1/0 COMPETITION LINE FOLLOWER + SUCTION
+//    Fixed: Noise-Free Calibration & Stable PD Tuning
+// =================================================================
+#include <Arduino.h>
+
+// --- 1. CONFIRMED WORKING PIN DEFINITIONS ---
+#define IN1 10  // Left Motor Forward
+#define IN2 9   // Left Motor Reverse
+#define IN3 6   // Right Motor Forward
+#define IN4 5   // Right Motor Reverse
+
+#define SUCTION_PIN 11 // D11 is OC2A on ATmega328P (Timer 2)
+
+// --- Suction Control Variable ---
+int suctionPowerPercent = 10; // 10% suction power (adjust as needed)
+
+const bool INVERT_STEERING = false; 
+
+// Left to Right: A7 down to A0
+const uint8_t sensorPins[8] = {A7, A6, A5, A4, A3, A2, A1, A0};
+
+int minVal[8];
+int maxVal[8];
+int threshold[8];
+int s[8];
+
+// Weights: Left is negative, Right is positive
+const int weights[8] = {-35, -20, -10, -5, 5, 10, 20, 35};
+
+// --- 2. HIGH-SPEED TUNING PARAMETERS ---
+int fastSpeed  = 180;  // High speed on straight track
+int baseSpeed  = 110;  // Cornering entry speed
+int maxSpeed   = 180;  // Motor speed ceiling
+int turnSpeed  = 170;  // Powerful tank-turn speed for sharp corners
+
+// Balanced PD tuning for smooth tracking without jitter/pulsing
+float Kp = 2.80;
+float Kd = 16.50;
+
+int lastError = 0;
+int lastDirection = 1; // 1 = Right, -1 = Left
+
+// --- 3. MOTOR & SUCTION CONTROL ---
+void setMotors(int leftSpeed, int rightSpeed) {
+  leftSpeed  = constrain(leftSpeed, -maxSpeed, maxSpeed);
+  rightSpeed = constrain(rightSpeed, -maxSpeed, maxSpeed);
+
+  // Left Motor (Pins 10 & 9)
+  if (leftSpeed >= 0) {
+    analogWrite(IN1, leftSpeed);
+    analogWrite(IN2, 0);
+  } else {
+    analogWrite(IN1, 0);
+    analogWrite(IN2, -leftSpeed);
+  }
+
+  // Right Motor (Pins 6 & 5)
+  if (rightSpeed >= 0) {
+    analogWrite(IN3, rightSpeed);
+    analogWrite(IN4, 0);
+  } else {
+    analogWrite(IN3, 0);
+    analogWrite(IN4, -rightSpeed);
+  }
+}
+
+void tankTurn(int dir) {
+  setMotors(dir * turnSpeed, -dir * turnSpeed);
+}
+
+// Function to change suction power dynamically (0 to 100 percent)
+void setSuctionPower(int percent) {
+  percent = constrain(percent, 0, 100);
+  suctionPowerPercent = percent;
+  OCR2A = (uint8_t)map(percent, 0, 100, 0, 255);
+}
+
+// --- 4. CALIBRATION ---
+void calibrateSensors() {
+  for (int i = 0; i < 8; i++) {
+    minVal[i] = 1023;
+    maxVal[i] = 0;
+  }
+
+  // 4 sweeps across the line
+  for (int sweep = 0; sweep < 4; sweep++) {
+    int dir = (sweep % 2 == 0) ? 1 : -1;
+    tankTurn(dir);
+
+    unsigned long t = millis();
+    while (millis() - t < 500) {
+      for (int i = 0; i < 8; i++) {
+        int val = analogRead(sensorPins[i]);
+        if (val < minVal[i]) minVal[i] = val;
+        if (val > maxVal[i]) maxVal[i] = val;
+      }
+      delay(2);
+    }
+    setMotors(0, 0);
+    delay(80);
+  }
+
+  // Each sensor calculates its own private 1/0 threshold
+  for (int i = 0; i < 8; i++) {
+    threshold[i] = (minVal[i] + maxVal[i]) / 2;
+  }
+}
+
+// Waits until you place the robot center on the line
+void waitForPlacement() {
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  while (true) {
+    digitalWrite(LED_BUILTIN, (millis() / 150) % 2); // Blink while waiting
+
+    int midLeft  = analogRead(sensorPins[3]); // A4
+    int midRight = analogRead(sensorPins[4]); // A3
+    int outLeft  = analogRead(sensorPins[0]); // A7
+    int outRight = analogRead(sensorPins[7]); // A0
+
+    bool midIsBlack = (midLeft > threshold[3]) || (midRight > threshold[4]);
+    bool outIsWhite = (outLeft < threshold[0]) && (outRight < threshold[7]);
+
+    if (midIsBlack && outIsWhite) {
+      digitalWrite(LED_BUILTIN, HIGH);
+      delay(600); // 0.6 second delay to release bot
+      break;
+    }
+    delay(10);
+  }
+}
+
+// --- 5. SETUP ---
+void setup() {
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  for (int i = 0; i < 8; i++) {
+    pinMode(sensorPins[i], INPUT);
+  }
+
+  // Set stable internal ADC reference
+  analogReference(DEFAULT);
+
+  // --- CONFIGURE TIMER 2 FOR ~31.4 kHz SUCTION IMPELLER (PIN 11) ---
+  pinMode(SUCTION_PIN, OUTPUT);
+  TCCR2A = 0;
+  TCCR2B = 0;
+
+  // Clear OC2A on Compare Match when up-counting, set when down-counting (Non-inverting PWM)
+  TCCR2A |= (1 << COM2A1);
+  // Set Phase-Correct PWM mode (WGM20 = 1, WGM21 = 0, WGM22 = 0)
+  TCCR2A |= (1 << WGM20);
+  // Set Prescaler to 1 (CS20 = 1, CS21 = 0, CS22 = 0)
+  TCCR2B |= (1 << CS20);
+
+  // KEEP SUCTION OFF (0%) DURING CALIBRATION TO PREVENT NOISE
+  OCR2A = 0; 
+  // -------------------------------------------------------------
+
+  delay(500);
+
+  // 1. Calibrate thresholds cleanly with zero motor/suction noise
+  calibrateSensors();
+
+  // 2. Wait for center placement on the line
+  waitForPlacement();
+
+  // 3. NOW START SUCTION FAN AT DESIRED POWER AFTER CALIBRATION IS DONE
+  setSuctionPower(suctionPowerPercent);
+  delay(200); // Short pause to let downforce establish before moving
+}
+
+// --- 6. MAIN LOOP ---
+void loop() {
+  int activeCount = 0;
+  int sum = 0;
+
+  // READ SENSORS AS CLEAN 1 OR 0
+  for (int i = 0; i < 8; i++) {
+    int raw = analogRead(sensorPins[i]);
+
+    if (raw > threshold[i]) {
+      s[i] = 1; // Black line
+      sum += weights[i];
+      activeCount++;
+    } else {
+      s[i] = 0; // White surface
+    }
+  }
+
+  // 1. LINE LOST RECOVERY
+  if (activeCount == 0) {
+    tankTurn(lastDirection);
+    return;
+  }
+
+  // 2. CALCULATE ERROR (-35 to +35)
+  int error = sum / activeCount;
+
+  if (error > 0) lastDirection = 1;
+  else if (error < 0) lastDirection = -1;
+
+  if (INVERT_STEERING) {
+    error = -error;
+  }
+
+  // 3. SHARP CORNER & 90-DEGREE TANK TURN
+  if (error > 15) {
+    // Sharp right turn -> Left forward, Right reverse
+    setMotors(turnSpeed, -turnSpeed);
+    lastError = error;
+    return;
+  }
+  else if (error < -15) {
+    // Sharp left turn -> Left reverse, Right forward
+    setMotors(-turnSpeed, turnSpeed);
+    lastError = error;
+    return;
+  }
+
+  // 4. DYNAMIC STRAIGHTAWAY BOOST
+  int currentCruisingSpeed = (abs(error) <= 5) ? fastSpeed : baseSpeed;
+
+  // 5. HIGH-SPEED PD CONTROL
+  int derivative = error - lastError;
+  int correction = (int)(Kp * error + Kd * derivative);
+  lastError = error;
+
+  int leftSpeed  = currentCruisingSpeed + correction;
+  int rightSpeed = currentCruisingSpeed - correction;
+
+  setMotors(leftSpeed, rightSpeed);
+}
